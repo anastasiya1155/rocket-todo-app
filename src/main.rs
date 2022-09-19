@@ -11,7 +11,8 @@ use rocket::tokio::time::{sleep, Duration};
 
 use diesel::prelude::*;
 use serde::{Deserialize};
-use rocket::{fairing::AdHoc, serde::json::Json, State, response::Debug};
+use rocket::{fairing::AdHoc, serde::json::Json, State, response::{Responder, status}, http::Status, request::Request};
+use rocket::serde::json::serde_json::json;
 use rocket_sync_db_pools::database;
 
 use models::Todo;
@@ -23,7 +24,29 @@ struct Config {
 }
 
 #[database("my_db")]
-pub struct Db(diesel::PgConnection);
+struct Db(diesel::PgConnection);
+
+struct ResponseError {
+    message: String,
+}
+
+impl ResponseError {
+    pub fn new(message: String) -> Self {
+        Self {
+            message
+        }
+    }
+}
+
+impl<'r> Responder<'r, 'static> for ResponseError {
+    fn respond_to(self, req: &'r Request<'_>) -> rocket::response::Result<'static> {
+        status::Custom(
+            Status::UnprocessableEntity,
+            Json(json!({"message": self.message})),
+        )
+            .respond_to(req)
+    }
+}
 
 #[get("/world")]
 fn world() -> &'static str {
@@ -48,25 +71,25 @@ async fn blocking_task() -> io::Result<Vec<u8>> {
 #[get("/<id>")]
 async fn get_todo(
     connection: Db, id: i32
-) -> Json<Todo> {
+) -> Result<Json<Todo>, ResponseError> {
     connection
         .run(move |c| schema::todos::table.filter(schema::todos::id.eq(id)).first(c))
         .await
         .map(Json)
-        .expect(format!("failed to fetch the todo with id: {}", id).as_str())
+        .map_err(|e| ResponseError::new(format!("Failed to fetch todo with id: {}, response: {:?}", id, e)))
 }
 
 #[get("/")]
-async fn get_all_todos(connection: Db) -> Json<Vec<Todo>> {
+async fn get_all_todos(connection: Db) -> Result<Json<Vec<Todo>>, ResponseError> {
     connection
         .run(|c| schema::todos::table.load(c))
         .await
         .map(Json)
-        .expect("Failed to fetch todos")
+        .map_err(|e| ResponseError::new(format!("Failed to fetch todos, response: {:?}", e)))
 }
 
 #[post("/", data = "<todo>")]
-async fn create_todo(connection: Db, todo: Json<Todo>) -> Json<Todo> {
+async fn create_todo(connection: Db, todo: Json<Todo>) -> Result<Json<Todo>, ResponseError> {
     connection
         .run(move |c| {
             diesel::insert_into(schema::todos::table)
@@ -75,7 +98,7 @@ async fn create_todo(connection: Db, todo: Json<Todo>) -> Json<Todo> {
         })
         .await
         .map(Json)
-        .expect("Failed to create todo")
+        .map_err(|e| ResponseError::new(format!("Failed to create todo, response: {:?}", e)))
 }
 
 #[get("/config")]
@@ -87,30 +110,44 @@ fn get_config(config: &State<Config>) -> String {
 }
 
 #[delete("/<id>")]
-async fn delete_todo(connection: Db, id: i32) -> Result<Option<()>, Debug<diesel::result::Error>> {
-    let res = connection
+async fn delete_todo(connection: Db, id: i32) -> Result<status::NoContent, ResponseError> {
+    connection
         .run(move |c| {
-            diesel::delete(schema::todos::table)
+            let affected = diesel::delete(schema::todos::table)
                 .filter(schema::todos::id.eq(id))
                 .execute(c)
+                .expect("Connection is broken");
+            match affected {
+                1 => Ok(()),
+                0 => Err("NotFound"),
+                _ => Err("???"),
+            }
         })
-        .await?;
-
-    Ok((res == 1).then(|| ()))
+        .await
+        .map(|_| status::NoContent)
+        .map_err(|e| ResponseError::new(format!("Failed to delete todo {}, response: {:?}", id, e)))
 }
 
 #[put("/<id>", data = "<todo>")]
-async fn update_todo(connection: Db, id: i32, todo: Json<Todo>) -> Result<(), Debug<diesel::result::Error>> {
+async fn update_todo(connection: Db, id: i32, todo: Json<Todo>) -> Result<status::NoContent, ResponseError> {
     connection
         .run(move |c| {
-            diesel::update(schema::todos::table.filter(schema::todos::id.eq(id)))
+            let affected = diesel::update(schema::todos::table.filter(schema::todos::id.eq(id)))
                 .set((
                     schema::todos::title.eq(&todo.title),
                     schema::todos::done.eq(&todo.done),
                 ))
                 .execute(c)
-        }).await?;
-    Ok(())
+                .expect("Connection is broken");
+            match affected {
+                1 => Ok(()),
+                0 => Err("NotFound"),
+                _ => Err("???"),
+            }
+        })
+        .await
+        .map(|_| status::NoContent)
+        .map_err(|e| ResponseError::new(format!("Failed to update todo {}, response: {:?}", id, e)))
 }
 
 #[rocket::main]
